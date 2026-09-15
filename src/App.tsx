@@ -1,6 +1,13 @@
-import { type FormEvent, useMemo, useState } from 'react';
+import {
+  FormEvent,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
 import './index.css';
-
+import { supabase } from './supabase';
+import { authFetch } from './authFetch';
+import { getCurrentGPS } from './geo';
 type Role = 'manager' | 'employee';
 type EmploymentStatus =
   | 'Active'
@@ -32,7 +39,23 @@ type Location = {
   address: string;
   managerName: string;
   phone: string;
+  latitude?: number;
+  longitude?: number;
+  radiusMeters: number;
   status: 'Active' | 'Inactive';
+};
+
+type TimeEntry = {
+  id: string;
+  companyId: string;
+  userId: string;
+  locationId: string;
+  clockIn: string;
+  clockOut?: string;
+  clockInLatitude: number;
+  clockInLongitude: number;
+  clockOutLatitude?: number;
+  clockOutLongitude?: number;
 };
 
 type User = {
@@ -41,7 +64,7 @@ type User = {
   role: Role;
   name: string;
   username: string;
-  password: string;
+  password?: string;
 
   phone?: string;
   email?: string;
@@ -148,6 +171,7 @@ type OnboardingProgress = {
 type ManagerPage =
   | 'dashboard'
   | 'employees'
+  | 'timeclock'
   | 'certificates'
   | 'reviews'
   | 'requirements'
@@ -156,8 +180,9 @@ type ManagerPage =
   | 'locations'
   | 'reports';
 
-type EmployeePage =
+  type EmployeePage =
   | 'dashboard'
+  | 'timeclock'
   | 'submit'
   | 'training'
   | 'profile';
@@ -886,6 +911,9 @@ export default function App() {
       )
     );
 
+    const [timeEntries, setTimeEntries] =
+  useState<TimeEntry[]>([]);
+
   const [
     history,
     setHistory,
@@ -938,27 +966,62 @@ export default function App() {
       )
     );
 
-  const [
-    sessionId,
-    setSessionId,
-  ] =
-    useState<
-      string | null
-    >(() =>
-      localStorage.getItem(
-        'certcue-session-v10'
-      )
-    );
+    const [sessionId, setSessionId] =
+    useState<string | null>(null);
 
-  const [
-    authPage,
-    setAuthPage,
-  ] = useState<
-    | 'login'
-    | 'employee-register'
-    | 'manager-register'
+    const [authPage, setAuthPage] = useState<
+    'login' |
+      'employee-register' |
+      'manager-register' |
+      'forgot-password'
   >('login');
 
+  async function refreshServerData() {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+  
+    if (!session) {
+      setSessionId(null);
+      return;
+    }
+  
+    const response = await fetch('/api/bootstrap', {
+      headers: {
+        Authorization: `Bearer ${session.access_token}`,
+      },
+    });
+  
+    if (!response.ok) {
+      setSessionId(null);
+      return;
+    }
+  
+    const data = await response.json();
+  
+    setCompanies([data.company]);
+    setUsers(data.users);
+    setLocations(data.locations);
+    setTimeEntries(data.timeEntries);
+    setSessionId(data.me.id);
+  }
+
+  useEffect(() => {
+    void refreshServerData();
+  }, []);
+
+  useEffect(() => {
+    if (!sessionId) return;
+  
+    const timer = window.setInterval(() => {
+      void refreshServerData();
+    }, 30000);
+  
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [sessionId]);
+  
   const currentUser =
     users.find(
       (user) =>
@@ -1075,27 +1138,29 @@ export default function App() {
     );
   }
 
-  function login(
-    userId: string
+  async function login(
+    accessToken: string,
+    refreshToken: string
   ) {
-    setSessionId(
-      userId
-    );
-
-    localStorage.setItem(
-      'certcue-session-v10',
-      userId
-    );
+    const { error } = await supabase.auth.setSession({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    });
+  
+    if (error) {
+      throw error;
+    }
+  
+    await refreshServerData();
   }
-
-  function logout() {
-    setSessionId(
-      null
-    );
-
-    localStorage.removeItem(
-      'certcue-session-v10'
-    );
+  
+  async function logout() {
+    await supabase.auth.signOut();
+  
+    setSessionId(null);
+    setUsers([]);
+    setLocations([]);
+    setTimeEntries([]);
   }
 
   if (!currentUser) {
@@ -1153,12 +1218,16 @@ export default function App() {
         certificates={
           certificates
         }
+       
         locations={
           locations
         }
+        timeEntries={timeEntries}
+        refreshServerData={refreshServerData}
         history={
           history
         }
+        
         trainings={
           trainings
         }
@@ -1216,6 +1285,8 @@ export default function App() {
       locations={
         locations
       }
+      timeEntries={timeEntries}
+      refreshServerData={refreshServerData}
       history={
         history
       }
@@ -1266,16 +1337,18 @@ function AuthScreen({
   login,
 }: {
   page:
+  | 'login'
+  | 'employee-register'
+  | 'manager-register'
+  | 'forgot-password';
+
+setPage: (
+  page:
     | 'login'
     | 'employee-register'
-    | 'manager-register';
-
-  setPage: (
-    page:
-      | 'login'
-      | 'employee-register'
-      | 'manager-register'
-  ) => void;
+    | 'manager-register'
+    | 'forgot-password'
+) => void;
 
   companies:
     Company[];
@@ -1300,16 +1373,32 @@ function AuthScreen({
   ) => void;
 
   login: (
-    userId: string
-  ) => void;
+    accessToken: string,
+    refreshToken: string
+  ) => Promise<void>;
 }) {
-  const [
-    loginRole,
-    setLoginRole,
-  ] =
-    useState<Role>(
-      'employee'
-    );
+  const rememberedLogin = loadData<{
+    companyId: string;
+    username: string;
+    role: Role;
+  } | null>('certcue-remember-login', null);
+  
+  const [loginRole, setLoginRole] = useState<Role>(
+    rememberedLogin?.role || 'employee'
+  );
+  
+  const [rememberMe, setRememberMe] = useState(
+    Boolean(rememberedLogin)
+  );
+
+  const [resetCodeSent, setResetCodeSent] =
+  useState(false);
+
+const [resetCompanyId, setResetCompanyId] =
+  useState('');
+
+const [resetUsername, setResetUsername] =
+  useState('');
 
   const [
     companySearch,
@@ -1326,13 +1415,14 @@ function AuthScreen({
           .toUpperCase()
     );
 
-  function handleLogin(
+    async function handleLogin(
     event:
       FormEvent<HTMLFormElement>
   ) {
     event.preventDefault();
 
     const form =
+  
       new FormData(
         event.currentTarget
       );
@@ -1419,232 +1509,216 @@ function AuthScreen({
       return;
     }
 
+    if (rememberMe) {
+      localStorage.setItem(
+        'certcue-remember-login',
+        JSON.stringify({
+          companyId,
+          username,
+          role: loginRole,
+        })
+      );
+    } else {
+      localStorage.removeItem('certcue-remember-login');
+    }
+
     login(
       account.id
     );
   }
 
-  function registerEmployee(
-    event:
-      FormEvent<HTMLFormElement>
+  async function sendResetCode(
+    event: FormEvent<HTMLFormElement>
   ) {
     event.preventDefault();
-
-    if (!foundCompany) {
+  
+    try {
+      const response = await fetch(
+        '/api/send-reset-code',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            companyId: resetCompanyId,
+            username: resetUsername,
+          }),
+        }
+      );
+  
+      const data = await response.json();
+  
+      if (!response.ok) {
+        return alert(data.error);
+      }
+  
+      setResetCodeSent(true);
+  
       alert(
-        'Enter a valid Company ID.'
+        'If the account information is correct, a verification code was sent.'
       );
-
-      return;
+    } catch {
+      alert('Unable to send verification code.');
     }
-
-    const form =
-      new FormData(
-        event.currentTarget
-      );
-
-    const username =
-      String(
-        form.get(
-          'username'
-        ) || ''
-      ).trim();
-
-    const exists =
-      users.some(
-        (user) =>
-          user.companyId ===
-            foundCompany.id &&
-          user.username
-            .toLowerCase() ===
-            username.toLowerCase()
-      );
-
-    if (exists) {
-      alert(
-        'That username already exists.'
-      );
-
-      return;
-    }
-
-    const employee:
-      User = {
-      id:
-        crypto.randomUUID(),
-
-      companyId:
-        foundCompany.id,
-
-      role:
-        'employee',
-
-      name:
-        String(
-          form.get(
-            'name'
-          ) || ''
-        ),
-
-      jobTitle:
-        String(
-          form.get(
-            'jobTitle'
-          ) || ''
-        ),
-
-      email:
-        String(
-          form.get(
-            'email'
-          ) || ''
-        ),
-
-      phone:
-        String(
-          form.get(
-            'phone'
-          ) || ''
-        ),
-
-      username,
-
-      password:
-        String(
-          form.get(
-            'password'
-          ) || ''
-        ),
-
-      employmentStatus:
-        'Active',
-    };
-
-    updateUsers([
-      ...users,
-      employee,
-    ]);
-
-    login(
-      employee.id
+  }
+  async function resetPassword(
+    event: FormEvent<HTMLFormElement>
+  ) {
+    event.preventDefault();
+  
+    const form = new FormData(event.currentTarget);
+  
+    const code = String(
+      form.get('code') || ''
+    ).trim();
+  
+    const newPassword = String(
+      form.get('newPassword') || ''
     );
+  
+    try {
+      const response = await fetch(
+        '/api/reset-password',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            companyId: resetCompanyId,
+            username: resetUsername,
+            code,
+            newPassword,
+          }),
+        }
+      );
+  
+      const data = await response.json();
+  
+      if (!response.ok) {
+        return alert(data.error);
+      }
+  
+      alert('Password changed successfully.');
+  
+      setResetCodeSent(false);
+      setResetCompanyId('');
+      setResetUsername('');
+      setPage('login');
+    } catch {
+      alert('Unable to reset password.');
+    }
+  }
+  async function registerEmployee(
+    event: FormEvent<HTMLFormElement>
+  ) {
+    event.preventDefault();
+  
+    const form = new FormData(event.currentTarget);
+  
+    try {
+      const response = await fetch('/api/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          mode: 'employee',
+          companyId: String(
+            form.get('companyId') || ''
+          )
+            .trim()
+            .toUpperCase(),
+          name: String(
+            form.get('name') || ''
+          ).trim(),
+          jobTitle: String(
+            form.get('jobTitle') || ''
+          ).trim(),
+          phone: String(
+            form.get('phone') || ''
+          ).trim(),
+          username: String(
+            form.get('username') || ''
+          ).trim(),
+          password: String(
+            form.get('password') || ''
+          ),
+        }),
+      });
+  
+      const data = await response.json();
+  
+      if (!response.ok) {
+        return alert(data.error);
+      }
+  
+      await login(
+        data.session.access_token,
+        data.session.refresh_token
+      );
+    } catch {
+      alert('Unable to register employee.');
+    }
   }
 
-  function registerManager(
-    event:
-      FormEvent<HTMLFormElement>
+  async function registerManager(
+    event: FormEvent<HTMLFormElement>
   ) {
     event.preventDefault();
-
-    const form =
-      new FormData(
-        event.currentTarget
+  
+    const form = new FormData(event.currentTarget);
+  
+    try {
+      const response = await fetch('/api/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          mode: 'manager',
+          companyName: String(
+            form.get('companyName') || ''
+          ).trim(),
+          name: String(
+            form.get('name') || ''
+          ).trim(),
+          phone: String(
+            form.get('phone') || ''
+          ).trim(),
+          username: String(
+            form.get('username') || ''
+          ).trim(),
+          password: String(
+            form.get('password') || ''
+          ),
+        }),
+      });
+  
+      const data = await response.json();
+  
+      if (!response.ok) {
+        return alert(data.error);
+      }
+  
+      alert(
+        `Company created!
+  
+  Company ID: ${data.company.id}
+  
+  Management ID: ${data.company.managementId}
+  
+  Save both IDs.`
       );
-
-    const companyId =
-      makeCode(
-        'CC'
+  
+      await login(
+        data.session.access_token,
+        data.session.refresh_token
       );
-
-    const managementId =
-      makeCode(
-        'MGT'
-      );
-
-    const company:
-      Company = {
-      id:
-        companyId,
-
-      managementId,
-
-      name:
-        String(
-          form.get(
-            'companyName'
-          ) || ''
-        ),
-    };
-
-    const manager:
-      User = {
-      id:
-        crypto.randomUUID(),
-
-      companyId,
-
-      role:
-        'manager',
-
-      name:
-        String(
-          form.get(
-            'name'
-          ) || ''
-        ),
-
-      username:
-        String(
-          form.get(
-            'username'
-          ) || ''
-        ),
-
-      password:
-        String(
-          form.get(
-            'password'
-          ) || ''
-        ),
-
-      employmentStatus:
-        'Active',
-    };
-
-    const newRequirements =
-      starterRequirements.map(
-        (
-          requirement
-        ) => ({
-          ...requirement,
-
-          id:
-            crypto.randomUUID(),
-
-          companyId,
-        })
-      );
-
-    updateCompanies([
-      ...companies,
-      company,
-    ]);
-
-    updateUsers([
-      ...users,
-      manager,
-    ]);
-
-    updateRequirements([
-      ...requirements,
-      ...newRequirements,
-    ]);
-
-    alert(
-      `Company created!
-
-Company ID:
-${companyId}
-
-Management ID:
-${managementId}
-
-Save both IDs.`
-    );
-
-    login(
-      manager.id
-    );
+    } catch {
+      alert('Unable to create company.');
+    }
   }
 
   return (
@@ -1708,65 +1782,65 @@ Save both IDs.`
 
             </div>
 
-            <form
-              className="auth-form"
-              onSubmit={
-                handleLogin
-              }
-            >
+            <form className="auth-form" onSubmit={handleLogin}>
+  <label>
+    Company ID
+    <input
+      name="companyId"
+      placeholder="CC-XXXXXX"
+      defaultValue={rememberedLogin?.companyId || ''}
+      required
+    />
+  </label>
 
-              <label>
-                Company ID
+  {loginRole === 'manager' && (
+    <label>
+      Management ID
+      <input
+        name="managementId"
+        placeholder="MGT-XXXXXX"
+        required
+      />
+    </label>
+  )}
 
-                <input
-                  name="companyId"
-                  placeholder="CC-XXXXXX"
-                  required
-                />
-              </label>
+  <label>
+    Username
+    <input
+      name="username"
+      defaultValue={rememberedLogin?.username || ''}
+      required
+    />
+  </label>
 
-              {loginRole ===
-                'manager' && (
-                <label>
-                  Management ID
+  <label>
+    Password
+    <input
+      type="password"
+      name="password"
+      required
+    />
+  </label>
 
-                  <input
-                    name="managementId"
-                    placeholder="MGT-XXXXXX"
-                    required
-                  />
-                </label>
-              )}
+  <label className="remember-me">
+    <input
+      type="checkbox"
+      checked={rememberMe}
+      onChange={(event) => setRememberMe(event.target.checked)}
+    />
+    <span>Remember Me</span>
+  </label>
 
-              <label>
-                Username
-
-                <input
-                  name="username"
-                  required
-                />
-              </label>
-
-              <label>
-                Password
-
-                <input
-                  type="password"
-                  name="password"
-                  required
-                />
-              </label>
-
-              <button
-                className="main-button"
-                type="submit"
-              >
-                Sign In
-              </button>
-
-            </form>
-
+  <button className="main-button" type="submit">
+    Sign In
+  </button>
+</form>
             <div className="auth-links">
+            <button
+  onClick={() => setPage('forgot-password')}
+>
+  Forgot Password?
+</button>
 
               <button
                 onClick={() =>
@@ -1792,7 +1866,93 @@ Save both IDs.`
 
           </>
         )}
+{page === 'forgot-password' && (
+  <>
+    <div className="auth-heading">
+      <h1>Reset Password</h1>
+      <p>
+        Verify your account and create a new password.
+      </p>
+    </div>
 
+    {!resetCodeSent ? (
+      <form
+        className="auth-form"
+        onSubmit={sendResetCode}
+      >
+        <label>
+          Company ID
+          <input
+            value={resetCompanyId}
+            onChange={(event) =>
+              setResetCompanyId(event.target.value)
+            }
+            placeholder="CC-XXXXXX"
+            required
+          />
+        </label>
+
+        <label>
+          Username
+          <input
+            value={resetUsername}
+            onChange={(event) =>
+              setResetUsername(event.target.value)
+            }
+            required
+          />
+        </label>
+
+        <button
+          className="main-button"
+          type="submit"
+        >
+          Send Verification Code
+        </button>
+      </form>
+    ) : (
+      <form
+        className="auth-form"
+        onSubmit={resetPassword}
+      >
+        <label>
+          Verification Code
+          <input
+            name="code"
+            required
+          />
+        </label>
+
+        <label>
+          New Password
+          <input
+            name="newPassword"
+            type="password"
+            minLength={8}
+            required
+          />
+        </label>
+
+        <button
+          className="main-button"
+          type="submit"
+        >
+          Change Password
+        </button>
+      </form>
+    )}
+
+    <button
+      className="back-button"
+      onClick={() => {
+        setResetCodeSent(false);
+        setPage('login');
+      }}
+    >
+      ← Back to Login
+    </button>
+  </>
+)}
         {page ===
           'employee-register' && (
           <>
@@ -1816,24 +1976,14 @@ Save both IDs.`
               }
             >
 
-              <label>
-                Company ID
-
-                <input
-                  value={
-                    companySearch
-                  }
-                  onChange={(
-                    event
-                  ) =>
-                    setCompanySearch(
-                      event.target.value
-                    )
-                  }
-                  placeholder="CC-XXXXXX"
-                  required
-                />
-              </label>
+<label>
+  Company ID
+  <input
+    name="companyId"
+    placeholder="CC-XXXXXX"
+    required
+  />
+</label>
 
               {companySearch && (
                 <div
@@ -1877,12 +2027,13 @@ Save both IDs.`
               </label>
 
               <label>
-                Phone
-
-                <input
-                  name="phone"
-                />
-              </label>
+  Phone
+  <input
+    name="phone"
+    type="tel"
+    required
+  />
+</label>
 
               <label>
                 Username
@@ -1968,6 +2119,15 @@ Save both IDs.`
               </label>
 
               <label>
+  Phone
+  <input
+    name="phone"
+    type="tel"
+    required
+  />
+</label>
+
+              <label>
                 Username
 
                 <input
@@ -2025,6 +2185,8 @@ function ManagerApp({
   requirements,
   certificates,
   locations,
+  timeEntries,
+  refreshServerData,
   history,
   trainings,
   onboardingItems,
@@ -2032,7 +2194,6 @@ function ManagerApp({
   updateUsers,
   updateRequirements,
   updateCertificates,
-  updateLocations,
   updateHistory,
   updateTrainings,
   updateOnboardingItems,
@@ -2054,7 +2215,8 @@ function ManagerApp({
 
   locations:
     Location[];
-
+    timeEntries: TimeEntry[];
+    refreshServerData: () => Promise<void>;
   history:
     CertificateHistory[];
 
@@ -2150,6 +2312,9 @@ function ManagerApp({
   ] =
     useState(false);
 
+    const [managerClockLocation, setManagerClockLocation] =
+  useState('');
+
   const company =
     companies.find(
       (company) =>
@@ -2186,6 +2351,26 @@ function ManagerApp({
         location.companyId ===
         company.id
     );
+
+    const managerActiveEntry = timeEntries.find(
+      (entry) =>
+        entry.userId === manager.id &&
+        !entry.clockOut
+    );
+
+    const companyTimeEntries = timeEntries.filter(
+      (entry) => entry.companyId === company.id
+    );
+
+    function hoursWorked(entry: TimeEntry) {
+      const start = new Date(entry.clockIn).getTime();
+    
+      const end = entry.clockOut
+        ? new Date(entry.clockOut).getTime()
+        : Date.now();
+    
+      return ((end - start) / 3600000).toFixed(2);
+    }
 
   const companyTrainings =
     trainings.filter(
@@ -2226,6 +2411,59 @@ function ManagerApp({
   ) {
     if (!locationId) {
       return 'Unassigned';
+    }
+
+    async function managerClockIn() {
+      if (!managerClockLocation) {
+        return alert('Select a workplace.');
+      }
+      async function managerClockOut() {
+        try {
+          const gps = await getCurrentGPS();
+      
+          const data = await authFetch('/api/clock', {
+            method: 'POST',
+            body: JSON.stringify({
+              action: 'out',
+              latitude: gps.latitude,
+              longitude: gps.longitude,
+              accuracy: gps.accuracy,
+            }),
+          });
+      
+          alert(data.message);
+          await refreshServerData();
+        } catch (error) {
+          alert(
+            error instanceof Error
+              ? error.message
+              : 'Unable to clock out.'
+          );
+        }
+      }
+      try {
+        const gps = await getCurrentGPS();
+    
+        const data = await authFetch('/api/clock', {
+          method: 'POST',
+          body: JSON.stringify({
+            action: 'in',
+            locationId: managerClockLocation,
+            latitude: gps.latitude,
+            longitude: gps.longitude,
+            accuracy: gps.accuracy,
+          }),
+        });
+    
+        alert(data.message);
+        await refreshServerData();
+      } catch (error) {
+        alert(
+          error instanceof Error
+            ? error.message
+            : 'Unable to clock in.'
+        );
+      }
     }
 
     return (
@@ -2689,180 +2927,105 @@ function ManagerApp({
     );
   }
 
-  function saveEmployeeProfile(
-    event:
-      FormEvent<HTMLFormElement>,
-
+  async function saveEmployeeProfile(
+    event: FormEvent<HTMLFormElement>,
     employee: User
   ) {
     event.preventDefault();
-
-    const form =
-      new FormData(
-        event.currentTarget
-      );
-
-    const updated:
-      User = {
+  
+    const form = new FormData(event.currentTarget);
+  
+    const updated: User = {
       ...employee,
-
-      name:
-        String(
-          form.get(
-            'name'
-          ) || ''
-        ),
-
-      phone:
-        String(
-          form.get(
-            'phone'
-          ) || ''
-        ),
-
-      email:
-        String(
-          form.get(
-            'email'
-          ) || ''
-        ),
-
-      address:
-        String(
-          form.get(
-            'address'
-          ) || ''
-        ),
-
-      emergencyContactName:
-        String(
-          form.get(
-            'emergencyContactName'
-          ) || ''
-        ),
-
-      emergencyContactPhone:
-        String(
-          form.get(
-            'emergencyContactPhone'
-          ) || ''
-        ),
-
-      jobTitle:
-        String(
-          form.get(
-            'jobTitle'
-          ) || ''
-        ),
-
-      hireDate:
-        String(
-          form.get(
-            'hireDate'
-          ) || ''
-        ),
-
-      locationId:
-        String(
-          form.get(
-            'locationId'
-          ) || ''
-        ),
-
-      employmentStatus:
-        String(
-          form.get(
-            'employmentStatus'
-          ) ||
-            'Active'
-        ) as EmploymentStatus,
-
-      supervisor:
-        String(
-          form.get(
-            'supervisor'
-          ) || ''
-        ),
-
-      notes:
-        String(
-          form.get(
-            'notes'
-          ) || ''
-        ),
+      name: String(form.get('name') || ''),
+      phone: String(form.get('phone') || ''),
+      email: String(form.get('email') || ''),
+      address: String(form.get('address') || ''),
+      emergencyContactName: String(
+        form.get('emergencyContactName') || ''
+      ),
+      emergencyContactPhone: String(
+        form.get('emergencyContactPhone') || ''
+      ),
+      jobTitle: String(form.get('jobTitle') || ''),
+      hireDate: String(form.get('hireDate') || ''),
+      locationId: String(
+        form.get('locationId') || ''
+      ),
+      employmentStatus: String(
+        form.get('employmentStatus') || 'Active'
+      ) as EmploymentStatus,
+      supervisor: String(
+        form.get('supervisor') || ''
+      ),
+      notes: String(form.get('notes') || ''),
     };
-
-    updateUsers(
-      users.map(
-        (user) =>
-          user.id ===
-          employee.id
+  
+    try {
+      if (updated.locationId) {
+        await authFetch('/api/assign-location', {
+          method: 'POST',
+          body: JSON.stringify({
+            userId: employee.id,
+            locationId: updated.locationId,
+          }),
+        });
+      }
+  
+      updateUsers(
+        users.map((user) =>
+          user.id === employee.id
             ? updated
             : user
-      )
-    );
-
-    alert(
-      'Employee profile saved.'
-    );
+        )
+      );
+  
+      alert('Employee profile saved.');
+    } catch (error) {
+      alert(
+        error instanceof Error
+          ? error.message
+          : 'Unable to save employee profile.'
+      );
+    }
   }
 
-  function addLocation(
-    event:
-      FormEvent<HTMLFormElement>
+  async function addLocation(
+    event: FormEvent<HTMLFormElement>
   ) {
     event.preventDefault();
-
-    const form =
-      new FormData(
-        event.currentTarget
+  
+    const form = new FormData(event.currentTarget);
+  
+    try {
+      await authFetch('/api/location', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: form.get('name'),
+          address: form.get('address'),
+          managerName: form.get('managerName'),
+          phone: form.get('phone'),
+          latitude: Number(form.get('latitude')),
+          longitude: Number(form.get('longitude')),
+          radiusMeters:
+            Number(form.get('radiusMeters')) || 100,
+        }),
+      });
+  
+      event.currentTarget.reset();
+  
+      await refreshServerData();
+  
+      alert('Location added.');
+    } catch (error) {
+      alert(
+        error instanceof Error
+          ? error.message
+          : 'Unable to add location.'
       );
-
-    updateLocations([
-      ...locations,
-
-      {
-        id:
-          crypto.randomUUID(),
-
-        companyId:
-          company.id,
-
-        name:
-          String(
-            form.get(
-              'name'
-            ) || ''
-          ),
-
-        address:
-          String(
-            form.get(
-              'address'
-            ) || ''
-          ),
-
-        managerName:
-          String(
-            form.get(
-              'managerName'
-            ) || ''
-          ),
-
-        phone:
-          String(
-            form.get(
-              'phone'
-            ) || ''
-          ),
-
-        status:
-          'Active',
-      },
-    ]);
-
-    event.currentTarget.reset();
+    }
   }
+ 
 
   function assignTraining(
     event:
@@ -3106,6 +3269,8 @@ function ManagerApp({
               'employees',
               'Employees',
             ],
+
+            ['timeclock', 'Time & Attendance'],
 
             [
               'certificates',
@@ -4105,7 +4270,139 @@ function ManagerApp({
 
           </section>
         )}
+{page === 'timeclock' && (
+  <section className="panel">
+    <div className="panel-heading">
+      <div>
+        <h2>Time & Attendance</h2>
+        <p>
+          Clock in or out and review company time records.
+        </p>
+      </div>
+    </div>
 
+    <div className="time-clock-card">
+      <h3>My Time Clock</h3>
+
+      {managerActiveEntry ? (
+        <>
+          <p>
+            Clocked in:{' '}
+            {new Date(
+              managerActiveEntry.clockIn
+            ).toLocaleString()}
+          </p>
+
+          <button
+            className="main-button"
+            onClick={managerClockOut}
+          >
+            Clock Out
+          </button>
+        </>
+      ) : (
+        <>
+          <select
+            value={managerClockLocation}
+            onChange={(event) =>
+              setManagerClockLocation(
+                event.target.value
+              )
+            }
+          >
+            <option value="">
+              Select workplace
+            </option>
+
+            {companyLocations
+              .filter(
+                (location) =>
+                  location.status === 'Active'
+              )
+              .map((location) => (
+                <option
+                  key={location.id}
+                  value={location.id}
+                >
+                  {location.name}
+                </option>
+              ))}
+          </select>
+
+          <button
+            className="main-button"
+            onClick={managerClockIn}
+          >
+            Clock In
+          </button>
+        </>
+      )}
+    </div>
+
+    <div className="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Role</th>
+            <th>Location</th>
+            <th>Clock In</th>
+            <th>Clock Out</th>
+            <th>Hours</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+
+        <tbody>
+          {companyTimeEntries.map((entry) => (
+            <tr key={entry.id}>
+              <td>
+                {employeeName(entry.userId)}
+              </td>
+
+              <td>
+                {users.find(
+                  (user) =>
+                    user.id === entry.userId
+                )?.role === 'manager'
+                  ? 'Management'
+                  : 'Employee'}
+              </td>
+
+              <td>
+                {locationName(entry.locationId)}
+              </td>
+
+              <td>
+                {new Date(
+                  entry.clockIn
+                ).toLocaleString()}
+              </td>
+
+              <td>
+                {entry.clockOut
+                  ? new Date(
+                      entry.clockOut
+                    ).toLocaleString()
+                  : '—'}
+              </td>
+
+              <td>
+                {hoursWorked(entry)}
+              </td>
+
+              <td>
+                {entry.clockOut
+                  ? 'Completed'
+                  : 'Clocked In'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </section>
+)}
         {page ===
           'locations' && (
           <section className="panel">
@@ -4155,6 +4452,31 @@ function ManagerApp({
                   name="phone"
                   placeholder="Phone"
                 />
+
+<input
+  name="latitude"
+  type="number"
+  step="any"
+  placeholder="Latitude"
+  required
+/>
+
+<input
+  name="longitude"
+  type="number"
+  step="any"
+  placeholder="Longitude"
+  required
+/>
+
+<input
+  name="radiusMeters"
+  type="number"
+  defaultValue="100"
+  min="25"
+  placeholder="Clock radius"
+  required
+/>
 
                 <button
                   className="main-button"
@@ -4621,6 +4943,8 @@ function EmployeeApp({
   requirements,
   certificates,
   locations,
+  timeEntries,
+  refreshServerData,
   history,
   trainings,
   onboardingItems,
@@ -4648,7 +4972,8 @@ function EmployeeApp({
 
   locations:
     Location[];
-
+    timeEntries: TimeEntry[];
+refreshServerData: () => Promise<void>;
   history:
     CertificateHistory[];
 
@@ -4743,6 +5068,67 @@ function EmployeeApp({
         location.id ===
         employee.locationId
     );
+    const activeTimeEntry = timeEntries.find(
+      (entry) =>
+        entry.userId === employee.id &&
+        !entry.clockOut
+    );
+    async function employeeClockIn() {
+      if (!employee.locationId) {
+        return alert(
+          'Management has not assigned you a workplace.'
+        );
+      }
+    
+      try {
+        const gps = await getCurrentGPS();
+    
+        const data = await authFetch('/api/clock', {
+          method: 'POST',
+          body: JSON.stringify({
+            action: 'in',
+            locationId: employee.locationId,
+            latitude: gps.latitude,
+            longitude: gps.longitude,
+            accuracy: gps.accuracy,
+          }),
+        });
+    
+        alert(data.message);
+        await refreshServerData();
+      } catch (error) {
+        alert(
+          error instanceof Error
+            ? error.message
+            : 'Unable to clock in.'
+        );
+      }
+    }
+
+    async function employeeClockOut() {
+      try {
+        const gps = await getCurrentGPS();
+    
+        const data = await authFetch('/api/clock', {
+          method: 'POST',
+          body: JSON.stringify({
+            action: 'out',
+            latitude: gps.latitude,
+            longitude: gps.longitude,
+            accuracy: gps.accuracy,
+          }),
+        });
+    
+        alert(data.message);
+        await refreshServerData();
+      } catch (error) {
+        alert(
+          error instanceof Error
+            ? error.message
+            : 'Unable to clock out.'
+        );
+      }
+    }
 
   const compliance =
     complianceForEmployee(
@@ -5299,6 +5685,13 @@ function EmployeeApp({
           </button>
 
           <button
+  className={page === 'timeclock' ? 'active' : ''}
+  onClick={() => setPage('timeclock')}
+>
+  Time Clock
+</button>
+
+          <button
             className={
               page ===
               'submit'
@@ -5370,19 +5763,16 @@ function EmployeeApp({
             </p>
 
             <h1>
-
-              {page ===
-                'dashboard'
-                ? 'My Dashboard'
-                : page ===
-                  'submit'
-                ? 'Submit Certificate'
-                : page ===
-                  'training'
-                ? 'My Training'
-                : 'My Profile'}
-
-            </h1>
+  {page === 'dashboard'
+    ? 'My Dashboard'
+    : page === 'timeclock'
+    ? 'Time Clock'
+    : page === 'submit'
+    ? 'Submit Certificate'
+    : page === 'training'
+    ? 'My Training'
+    : 'My Profile'}
+</h1>
 
           </div>
 
@@ -5601,6 +5991,54 @@ function EmployeeApp({
 
           </>
         )}
+
+{page === 'timeclock' && (
+  <section className="panel">
+    <div className="panel-heading">
+      <div>
+        <h2>Time Clock</h2>
+        <p>
+          Clock in and out from your assigned workplace.
+        </p>
+      </div>
+    </div>
+
+    <div className="time-clock-card">
+      <h3>
+        {location?.name || 'No workplace assigned'}
+      </h3>
+
+      {activeTimeEntry ? (
+        <>
+          <p>
+            Clocked in:{' '}
+            {new Date(
+              activeTimeEntry.clockIn
+            ).toLocaleString()}
+          </p>
+
+          <button
+            className="main-button"
+            onClick={employeeClockOut}
+          >
+            Clock Out
+          </button>
+        </>
+      ) : (
+        <>
+          <p>You are currently clocked out.</p>
+
+          <button
+            className="main-button"
+            onClick={employeeClockIn}
+          >
+            Clock In
+          </button>
+        </>
+      )}
+    </div>
+  </section>
+)}
 
         {page ===
           'submit' && (
@@ -7050,6 +7488,8 @@ function pageTitle(
 
     employees:
       'Employees',
+
+      timeclock: 'Time & Attendance',
 
     certificates:
       'Certificate Lookup',

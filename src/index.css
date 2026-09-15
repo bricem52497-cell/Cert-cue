@@ -2514,3 +2514,48 @@ td strong {
       column;
   }
 }
+.remember-me {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.remember-me input {
+  width: 14px !important;
+  height: 14px !important;
+  margin: 0;
+  cursor: pointer;
+}
+
+.remember-me span {
+  font-size: 12px;
+}
+
+.time-clock-card {
+  padding: 24px;
+  margin: 20px;
+  border: 1px solid #e5e8ee;
+  border-radius: 16px;
+  background: white;
+}
+
+.time-clock-card h3 {
+  margin-top: 0;
+}
+
+.time-clock-card select {
+  width: 100%;
+  max-width: 420px;
+  padding: 12px;
+  margin-bottom: 14px;
+  border: 1px solid #d8dde6;
+  border-radius: 8px;
+}
+
+.time-clock-card .main-button {
+  margin-top: 10px;
+}
