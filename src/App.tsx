@@ -1716,8 +1716,14 @@ const [resetUsername, setResetUsername] =
         data.session.access_token,
         data.session.refresh_token
       );
-    } catch {
-      alert('Unable to create company.');
+    } catch (error) {
+      console.error(error);
+    
+      alert(
+        error instanceof Error
+          ? error.message
+          : 'Unable to create company.'
+      );
     }
   }
 
